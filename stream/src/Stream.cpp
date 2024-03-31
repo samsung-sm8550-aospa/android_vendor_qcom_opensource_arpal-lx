@@ -371,7 +371,9 @@ int32_t Stream::getEffectParameters(void *effect_query)
     }
     pal_param_payload *pal_param = (pal_param_payload *)effect_query;
     effect_pal_payload_t *effectPayload = (effect_pal_payload_t *)pal_param->payload;
+    mGetParamMutex.lock();
     status = session->getEffectParameters(this, effectPayload);
+    mGetParamMutex.unlock();
     if (status) {
        PAL_ERR(LOG_TAG, "getParameters failed with %d", status);
     }
@@ -836,9 +838,9 @@ int32_t Stream::getTimestamp(struct pal_session_time *stime)
         PAL_ERR(LOG_TAG, "Sound card offline, status %d", status);
         goto exit;
     }
-    rm->lockResourceManagerMutex();
+    mGetParamMutex.lock();
     status = session->getTimestamp(stime);
-    rm->unlockResourceManagerMutex();
+    mGetParamMutex.unlock();
     if (0 != status) {
         PAL_ERR(LOG_TAG, "Failed to get session timestamp status %d", status);
         if (errno == -ENETRESET &&
@@ -1406,7 +1408,7 @@ int32_t Stream::switchDevice(Stream* streamHandle, uint32_t numDev, struct pal_d
     bool voice_call_switch = false;
     uint32_t force_switch_dev_id = PAL_DEVICE_IN_MAX;
     uint32_t curDeviceSlots[PAL_DEVICE_IN_MAX], newDeviceSlots[PAL_DEVICE_IN_MAX];
-    std::vector <std::tuple<Stream *, uint32_t>> streamDevDisconnect, sharedBEStreamDev;
+    std::vector <std::tuple<Stream *, uint32_t>> streamDevDisconnect, sharedBEStreamDev, streamsSkippingSwitch;
     std::vector <std::tuple<Stream *, struct pal_device *>> StreamDevConnect;
     struct pal_device dAttr;
     struct pal_device_info deviceInfo;
@@ -1775,21 +1777,8 @@ int32_t Stream::switchDevice(Stream* streamHandle, uint32_t numDev, struct pal_d
                 }
                 if (voice_call_switch) {
                     for (const auto &elem : sharedBEStreamDev) {
-                        struct pal_stream_attributes sAttr;
-                        Stream *strm = std::get<0>(elem);
-                        pal_device_id_t newDeviceId = newDevices[newDeviceSlots[i]].id;
-                        int status = strm->getStreamAttributes(&sAttr);
-
-                        if (status) {
-                            PAL_ERR(LOG_TAG,"getStreamAttributes Failed \n");
-                            mStreamMutex.unlock();
-                            rm->unlockActiveStream();
-                            return status;
-                        }
-
-                        if (sAttr.type == PAL_STREAM_ULTRASOUND &&
-                             (newDeviceId != PAL_DEVICE_OUT_HANDSET && newDeviceId != PAL_DEVICE_OUT_SPEAKER)) {
-                            PAL_DBG(LOG_TAG, "Ultrasound stream running on speaker/handset. Not switching to device (%d)", newDeviceId);
+                        if (!rm->isValidDeviceSwitchForStream(std::get<0>(elem), newDevices[newDeviceSlots[i]].id)) {
+                            streamsSkippingSwitch.push_back(elem);
                             continue;
                         }
 
@@ -1853,8 +1842,16 @@ int32_t Stream::switchDevice(Stream* streamHandle, uint32_t numDev, struct pal_d
         rm->unlockActiveStream();
         goto done;
     }
+
     mStreamMutex.unlock();
     rm->unlockActiveStream();
+
+    status = rm->restoreDeviceConfigForUPD(streamDevDisconnect, StreamDevConnect,
+                                           streamsSkippingSwitch);
+    if (status) {
+        PAL_ERR(LOG_TAG, "Error restoring device config for UPD");
+        goto done;
+    }
 
     status = rm->streamDevSwitch(streamDevDisconnect, StreamDevConnect);
     if (status) {
